@@ -1,0 +1,498 @@
+"""ESP (electrostatic potential) surface rendering.
+
+Hybrid approach: projects density and ESP cube data to 2D, builds a
+smooth-gradient heatmap PNG from ESP values with 3D lighting, then
+extracts density contour rings (like dens.py) for depth-graded
+clip-path rendering in SVG.
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import logging
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+import numpy as np
+
+from xyzrender.cmap import build_palette_lut
+from xyzrender.contours import (
+    MIN_LOOP_PERIMETER,
+    LobeContour2D,
+    chain_segments,
+    combined_path_d,
+    compute_grid_positions,
+    gaussian_blur_2d,
+    loop_perimeter,
+    marching_squares,
+    resample_loop,
+    upsample_2d,
+)
+
+if TYPE_CHECKING:
+    from xyzrender.cube import CubeData
+    from xyzrender.types import ESPParams
+
+logger = logging.getLogger(__name__)
+
+_N_LAYERS = 6  # contour threshold levels for depth-graded clip-path rings
+_PROJ_MULT = 3  # projection grid multiplier to avoid Moiré when tilted
+_PROJ_BLUR = 3.5  # Gaussian blur sigma (fills gaps + smooths grid structure)
+_SHELL_UPPER = 6.0  # max density/isovalue ratio for shell voxels
+_FRONT_DECAY = 2.0  # angstroms — exponential decay from frontmost surface
+_LIGHT_DIR = np.array([-0.45, 0.5, 0.75])
+_LIGHT_DIR = _LIGHT_DIR / np.linalg.norm(_LIGHT_DIR)
+_SAT_BOOST = 2.0  # hyper-saturation for SVG layered opacity rendering
+_MIN_PNG_RES = 500  # upscale threshold for low-res heatmap PNGs
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ESPSurface:
+    """Pre-computed ESP surface: heatmap PNG + density contour layers."""
+
+    png_data_uri: str = ""
+    resolution: int = 0
+    x_min: float = 0.0
+    x_max: float = 0.0
+    y_min: float = 0.0
+    y_max: float = 0.0
+    # Density contour layers for depth-graded clip-path rendering
+    layers: list[LobeContour2D] = field(default_factory=list)
+    # ESP value range used for color mapping (for caching across GIF frames)
+    esp_vmin: float = 0.0
+    esp_vmax: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# ESP surface building
+# ---------------------------------------------------------------------------
+
+
+def build_esp_surface(
+    dens_cube: CubeData,
+    esp_cube: CubeData,
+    params: ESPParams,
+    *,
+    palette: str = "rainbow",
+    rot: np.ndarray | None = None,
+    atom_centroid: np.ndarray | None = None,
+    target_centroid: np.ndarray | None = None,
+    pos_flat_ang: np.ndarray | None = None,
+    flat_indices: np.ndarray | None = None,
+    fixed_bounds: tuple[float, float, float, float] | None = None,
+    n_layers: int = _N_LAYERS,
+    upsample: int = 6,
+    esp_range: tuple[float, float] | None = None,
+    esp_symm: bool = False,
+    normals_phys: np.ndarray | None = None,
+) -> ESPSurface:
+    """Build an ESP surface: heatmap PNG + density contour layers.
+
+    Projects density and ESP to 2D, builds an RGB heatmap from ESP values
+    with 3D lighting, then extracts density contour rings for depth-graded
+    clip-path rendering.
+
+    Parameters
+    ----------
+    dens_cube:
+        Gaussian cube file containing electron density values.
+    esp_cube:
+        Gaussian cube file containing electrostatic potential values.
+    params:
+        ESP surface parameters (isovalue of the density isosurface).
+    rot:
+        Optional rotation matrix for cube-grid alignment.
+    atom_centroid:
+        Centroid of the original cube atom positions (Å).
+    target_centroid:
+        Centroid of the current (possibly rotated) atom positions (Å).
+    pos_flat_ang:
+        Pre-computed flattened grid positions (cached between GIF frames).
+    flat_indices:
+        Pre-computed indices of above-isovalue voxels (cached).
+    fixed_bounds:
+        Fixed ``(x_min, x_max, y_min, y_max)`` in Å (cached between GIF frames).
+    n_layers:
+        Number of density contour threshold levels for depth-graded rendering.
+    upsample:
+        Integer upsampling factor for the ESP heatmap raster.
+    esp_range:
+        Optional ``(vmin, vmax)`` range for ESP color mapping.
+    esp_symm:
+        If ``True``, use a symmetric ESP range about zero based on the
+        projected ESP values on the visible surface.
+    normals_phys:
+        Pre-computed surface normals in physical space (cached).
+
+    Returns
+    -------
+    ESPSurface
+        Heatmap PNG and density contour layers ready for SVG rendering.
+    """
+    isovalue = params.isovalue
+    n1, n2, n3 = dens_cube.grid_shape
+    base_res = max(n1, n2, n3)
+
+    if pos_flat_ang is None:
+        pos_flat_ang = compute_grid_positions(dens_cube)
+
+    if flat_indices is None:
+        mask = dens_cube.grid_data >= isovalue
+        flat_indices = np.flatnonzero(mask)
+
+    dens_values_flat = dens_cube.grid_data.ravel()
+    esp_values_flat = esp_cube.grid_data.ravel()
+    lobe_pos = pos_flat_ang[flat_indices].copy()
+    lobe_dens = dens_values_flat[flat_indices]
+    lobe_esp = esp_values_flat[flat_indices]
+
+    # Shell mask: only voxels near the isosurface (not deep interior).
+    # ESP colors, lighting, and depth all sample from the surface shell only.
+    shell = lobe_dens <= isovalue * _SHELL_UPPER
+
+    # Rotate positions
+    if rot is not None:
+        if atom_centroid is not None:
+            lobe_pos -= atom_centroid
+        lobe_pos = lobe_pos @ rot.T
+        if target_centroid is not None:
+            lobe_pos += target_centroid
+
+    # Tight bounds
+    vx_xmin = float(lobe_pos[:, 0].min())
+    vx_xmax = float(lobe_pos[:, 0].max())
+    vx_ymin = float(lobe_pos[:, 1].min())
+    vx_ymax = float(lobe_pos[:, 1].max())
+    vx_xpad = (vx_xmax - vx_xmin) * 0.02 + 1e-9
+    vx_ypad = (vx_ymax - vx_ymin) * 0.02 + 1e-9
+
+    if fixed_bounds is not None:
+        x_min, x_max, y_min, y_max = fixed_bounds
+    else:
+        x_min = vx_xmin - vx_xpad
+        x_max = vx_xmax + vx_xpad
+        y_min = vx_ymin - vx_ypad
+        y_max = vx_ymax + vx_ypad
+
+    # Use a finer projection grid to avoid Moiré artifacts when tilted.
+    proj_res = base_res * _PROJ_MULT
+
+    # Pixel coordinates for all above-isovalue voxels
+    lx, ly = lobe_pos[:, 0], lobe_pos[:, 1]
+    xi = np.clip(
+        ((lx - x_min) / (x_max - x_min) * (proj_res - 1)).astype(int),
+        0,
+        proj_res - 1,
+    )
+    yi = np.clip(
+        ((ly - y_min) / (y_max - y_min) * (proj_res - 1)).astype(int),
+        0,
+        proj_res - 1,
+    )
+
+    # Density max-intensity projection (all voxels — needed for contours)
+    grid_2d = np.zeros((proj_res, proj_res))
+    np.maximum.at(grid_2d, (yi, xi), lobe_dens)
+
+    # Shell-only pixel coords for ESP/lighting/depth
+    s_xi, s_yi = xi[shell], yi[shell]
+    s_esp = lobe_esp[shell]
+    s_z = lobe_pos[shell, 2]
+
+    # Front-depth weight: exponential decay from the frontmost surface
+    s_z_max = float(s_z.max()) if s_z.size > 0 else 0.0
+    s_front_wt = np.exp((s_z - s_z_max) / _FRONT_DECAY)
+
+    # Shared front-weight accumulation (ESP, lighting, Z all use the same
+    # scatter coordinates and weights — accumulate once, reuse for all three)
+    wt_sum = np.zeros((proj_res, proj_res))
+    np.add.at(wt_sum, (s_yi, s_xi), s_front_wt)
+    has_wt = wt_sum > 0
+
+    # ESP weighted projection (shell only)
+    esp_sum = np.zeros((proj_res, proj_res))
+    np.add.at(esp_sum, (s_yi, s_xi), s_front_wt * s_esp)
+    grid_2d_esp = np.divide(esp_sum, wt_sum, out=np.zeros_like(esp_sum), where=has_wt)
+
+    # --- 3D surface normal lighting (shell only) ---
+    if normals_phys is not None:
+        s_norms = normals_phys[flat_indices[shell]].copy()
+        if rot is not None:
+            s_norms = s_norms @ rot.T
+        s_norms = -s_norms  # outward = -gradient
+        lengths = np.sqrt((s_norms * s_norms).sum(axis=1))
+        lengths = np.maximum(lengths, 1e-12)
+        s_norms /= lengths[:, np.newaxis]
+        s_lambert = np.clip(s_norms @ _LIGHT_DIR, 0.0, 1.0)
+    else:
+        s_lambert = np.full(shell.sum(), 0.65)
+
+    light_sum = np.zeros((proj_res, proj_res))
+    np.add.at(light_sum, (s_yi, s_xi), s_front_wt * s_lambert)
+    grid_2d_light = np.divide(light_sum, wt_sum, out=np.full_like(light_sum, 0.65), where=has_wt)
+
+    # --- Z-depth map for depth fading (shell only) ---
+    z_sum = np.zeros((proj_res, proj_res))
+    np.add.at(z_sum, (s_yi, s_xi), s_front_wt * s_z)
+    grid_2d_z = np.divide(z_sum, wt_sum, out=np.zeros_like(z_sum), where=has_wt)
+
+    # Crop to non-zero bounding box + blur padding before blur/upsample.
+    # Avoids processing large empty regions of the projection grid.
+    nz_rows, nz_cols = np.nonzero(grid_2d)
+    if len(nz_rows) == 0:
+        return ESPSurface(x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max)
+    blur_pad = max(3, int(_PROJ_BLUR * 2 * 1.5) + 1)  # accommodate largest blur sigma
+    r0 = max(0, int(nz_rows.min()) - blur_pad)
+    r1 = min(proj_res, int(nz_rows.max()) + blur_pad + 1)
+    c0 = max(0, int(nz_cols.min()) - blur_pad)
+    c1 = min(proj_res, int(nz_cols.max()) + blur_pad + 1)
+
+    _up = max(1, upsample // _PROJ_MULT)
+    blurred_dens = np.maximum(gaussian_blur_2d(grid_2d[r0:r1, c0:c1], _PROJ_BLUR), 0.0)
+    blurred_esp = gaussian_blur_2d(grid_2d_esp[r0:r1, c0:c1], _PROJ_BLUR * 1.5)
+    blurred_light = gaussian_blur_2d(grid_2d_light[r0:r1, c0:c1], _PROJ_BLUR * 0.5)
+    blurred_z = gaussian_blur_2d(grid_2d_z[r0:r1, c0:c1], _PROJ_BLUR * 0.8)
+    up_dens = upsample_2d(blurred_dens, _up)
+    up_esp = upsample_2d(blurred_esp, _up)
+    up_light = upsample_2d(blurred_light, _up)
+    up_z = upsample_2d(blurred_z, _up)
+
+    h, w = up_dens.shape
+    # Resolution and offsets for coordinate mapping (contour loops → screen)
+    res = proj_res * _up
+    crop_off_r = r0 * _up
+    crop_off_c = c0 * _up
+
+    # --- Build ESP heatmap PNG ---
+    esp_above = up_esp[up_dens > isovalue]
+    if esp_above.size == 0:
+        return ESPSurface(
+            resolution=res,
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+        )
+
+    # Use fixed ESP range if provided (stabilizes colors across GIF frames),
+    # otherwise derive it from this frame's projected data.
+    if esp_range is not None:
+        esp_vmin, esp_vmax = esp_range
+    elif esp_symm:
+        abs_max = max(abs(float(esp_above.min())), abs(float(esp_above.max())))
+        esp_vmin, esp_vmax = -abs_max, abs_max
+    else:
+        esp_vmin = float(np.percentile(esp_above, 5))
+        esp_vmax = float(np.percentile(esp_above, 95))
+
+    # Normalize across the projected ESP range used for the colorbar so the
+    # rendered surface and legend describe the same field.
+    esp_span = max(esp_vmax - esp_vmin, 1e-10)
+    esp_norm = np.clip((up_esp - esp_vmin) / esp_span, 0.0, 1.0)
+    lut = build_palette_lut(palette)
+
+    surface_mask = up_dens > isovalue * 0.5
+    lut_idx = np.where(surface_mask, (esp_norm * 255).astype(np.uint8), 0)
+
+    # --- Lighting: directional + depth fog ---
+    # 3D surface normals → Lambertian shading
+    diffuse = np.clip(up_light, 0.0, 1.0)
+
+    # Z-depth fog: front vivid, back washed toward white
+    z_surf = up_z[surface_mask]
+    if z_surf.size > 0:
+        z_lo, z_hi = float(z_surf.min()), float(z_surf.max())
+        z_range = max(z_hi - z_lo, 1e-10)
+        z_norm = np.clip((up_z - z_lo) / z_range, 0.0, 1.0)
+    else:
+        z_norm = np.ones((h, w))
+    depth_fade = 0.40 + 0.60 * z_norm  # 1.0 at front, 0.40 at back
+
+    # Step 1: Get base LUT colors at full brightness and boost saturation
+    # FIRST, before any darkening.  Each layer is displayed at ~0.11
+    # opacity over white, so the source PNG must be hyper-saturated.
+    rgb_f = np.full((h, w, 3), 255.0)
+    for ch in range(3):
+        rgb_f[:, :, ch] = np.where(
+            surface_mask,
+            lut[lut_idx, ch].astype(float),
+            255.0,
+        )
+    gray = np.where(
+        surface_mask,
+        (rgb_f[:, :, 0] + rgb_f[:, :, 1] + rgb_f[:, :, 2]) / 3.0,
+        255.0,
+    )
+    for ch in range(3):
+        rgb_f[:, :, ch] = np.where(
+            surface_mask,
+            gray + _SAT_BOOST * (rgb_f[:, :, ch] - gray),
+            255.0,
+        )
+
+    # Step 2: Apply lighting and depth as brightness modulation.
+    # The sat-boosted colors are vivid enough to survive the darkening.
+    brightness = 0.20 + 0.95 * diffuse * depth_fade
+
+    # Fog: blend back parts toward white for subtle depth cue.
+    fog = (1.0 - depth_fade) * 0.12
+
+    for ch in range(3):
+        rgb_f[:, :, ch] = np.where(
+            surface_mask,
+            rgb_f[:, :, ch] * brightness * (1.0 - fog) + 255.0 * fog,
+            255.0,
+        )
+    # Post-upsample smooth: remove residual grid structure (checkerboard)
+    for ch in range(3):
+        rgb_f[:, :, ch] = gaussian_blur_2d(rgb_f[:, :, ch], 0.8)
+    rgb = np.clip(rgb_f, 0, 255).astype(np.uint8)
+
+    # --- Alpha: fully opaque within surface, soft edge at boundary ---
+    # Clip paths handle the depth-graded ring shape; PNG just needs
+    # clean color data with a smooth boundary.
+    edge = np.clip(
+        (up_dens - isovalue * 0.3) / (isovalue * 1.2),
+        0.0,
+        1.0,
+    )
+    alpha = (edge * 255).astype(np.uint8)
+
+    # --- Extract contours for depth-graded clipping ---
+    # Additive Z-shift: front-facing regions get a density boost so
+    # contour thresholds are reached further out → wider ring spacing.
+    # Back regions are unshifted → rings pack tighter → depth cueing.
+    # (Additive avoids the edge-clustering of multiplicative Z-modulation.)
+    z_surf_vals = up_z[surface_mask]
+    if z_surf_vals.size > 0:
+        z_s_lo = float(z_surf_vals.min())
+        z_s_range = max(float(z_surf_vals.max()) - z_s_lo, 1e-10)
+        z_01 = np.clip((up_z - z_s_lo) / z_s_range, 0.0, 1.0)
+    else:
+        z_01 = np.ones((h, w))
+    contour_field = up_dens + isovalue * 0.5 * z_01
+    # Extra smoothing prevents checkerboard artifacts from grid structure
+    contour_field = gaussian_blur_2d(contour_field, _PROJ_BLUR * 0.25)
+
+    above = contour_field[surface_mask]
+    layers: list[LobeContour2D] = []
+    if above.size > 0:
+        upper = float(np.percentile(above, 85))
+        upper = max(upper, isovalue * 1.5)
+        thresholds = np.geomspace(isovalue, upper, n_layers)
+        crop_offset = np.array([crop_off_r, crop_off_c])
+        for threshold in thresholds:
+            raw_loops = chain_segments(marching_squares(contour_field, float(threshold)))
+            offset_loops = [loop + crop_offset for loop in raw_loops]
+            loops = [resample_loop(lp) for lp in offset_loops if loop_perimeter(lp) >= MIN_LOOP_PERIMETER]
+            if loops:
+                layers.append(LobeContour2D(loops=loops, phase="pos", z_depth=0.0))
+
+    # Flip vertically (numpy row 0 = y_min, PNG row 0 = top = y_max)
+    rgba = np.dstack([rgb, alpha])
+    rgba = np.flipud(rgba)
+
+    from PIL import Image
+
+    img = Image.fromarray(rgba, "RGBA")
+    # Smooth upscale low-res images (e.g. GIF frames at 240x240) so that
+    # individual voxel pixels aren't visible in the final output.
+    if img.width < _MIN_PNG_RES or img.height < _MIN_PNG_RES:
+        target = max(_MIN_PNG_RES, img.width * 3, img.height * 3)
+        img = img.resize((target, target), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", compress_level=1)
+    png_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    data_uri = f"data:image/png;base64,{png_b64}"
+
+    total_loops = sum(len(lc.loops) for lc in layers)
+    logger.debug(
+        "ESP surface: %dx%d heatmap, %d contour layers (%d loops), ESP [%.4g, %.4g]",
+        w,
+        h,
+        len(layers),
+        total_loops,
+        esp_vmin,
+        esp_vmax,
+    )
+
+    return ESPSurface(
+        png_data_uri=data_uri,
+        resolution=res,
+        x_min=x_min,
+        x_max=x_max,
+        y_min=y_min,
+        y_max=y_max,
+        layers=layers,
+        esp_vmin=esp_vmin,
+        esp_vmax=esp_vmax,
+    )
+
+
+# ---------------------------------------------------------------------------
+# ESP SVG rendering — PNG heatmap clipped by density contour rings
+# ---------------------------------------------------------------------------
+
+
+_ESP_BASE_OPACITY = 1.0  # base opacity for ESP surface (scaled by surface_opacity)
+
+
+def esp_surface_svg(
+    esp: ESPSurface,
+    scale: float,
+    cx: float,
+    cy: float,
+    canvas_w: int,
+    canvas_h: int,
+    surface_opacity: float = 1.0,
+) -> list[str]:
+    """Render ESP surface as contour-clipped heatmap layers.
+
+    The PNG provides smooth ESP color gradients.  Each density contour
+    layer clips the PNG and is rendered at ``base_opacity * surface_opacity / n_layers``
+    opacity.  Where more layers overlap (inner rings), opacity accumulates
+    — producing the same depth-graded ring aesthetic as ``dens_layers_svg``.
+    """
+    if not esp.png_data_uri or not esp.layers:
+        return []
+
+    img_x = canvas_w / 2 + scale * (esp.x_min - cx)
+    img_y = canvas_h / 2 - scale * (esp.y_max - cy)
+    img_w = scale * (esp.x_max - esp.x_min)
+    img_h = scale * (esp.y_max - esp.y_min)
+
+    n = len(esp.layers)
+    per_layer = _ESP_BASE_OPACITY * surface_opacity / n
+
+    lines: list[str] = ["  <defs>"]
+    lines.append(
+        f'    <image id="esp_heatmap" x="{img_x:.1f}" y="{img_y:.1f}" '
+        f'width="{img_w:.1f}" height="{img_h:.1f}" '
+        f'href="{esp.png_data_uri}" '
+        f'preserveAspectRatio="none" image-rendering="optimizeQuality"/>'
+    )
+
+    # Build clip paths from contour layers (duck-type: ESPSurface has
+    # the same .resolution/.x_min/.x_max/.y_min/.y_max as MOContours)
+    clip_ids: list[str] = []
+    for i, lobe in enumerate(esp.layers):
+        d = combined_path_d(lobe.loops, esp, scale, cx, cy, canvas_w, canvas_h)
+        if d:
+            clip_id = f"esp_clip_{i}"
+            clip_ids.append(clip_id)
+            lines.append(f'    <clipPath id="{clip_id}">')
+            lines.append(f'      <path d="{d}" fill-rule="evenodd"/>')
+            lines.append("    </clipPath>")
+
+    lines.append("  </defs>")
+
+    for clip_id in clip_ids:
+        lines.append(f'  <use href="#esp_heatmap" clip-path="url(#{clip_id})" opacity="{per_layer:.3f}"/>')
+
+    return lines
