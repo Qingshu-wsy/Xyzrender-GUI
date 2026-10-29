@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "This repository adds a graphical interface to the xyzrender molecular rendering engine. Please cite the engine article below when using its scientific methods."
+title: "xyzrender GUI"
+authors:
+  - family-names: Wei
+    given-names: Shanyue
+version: 0.3.1
+license: MIT
+preferred-citation:
+  type: article
+  authors:
+    - family-names: Goodfellow
+      given-names: "A. S."
+    - family-names: Nguyen
+      given-names: "B. N."
+  title: "Graph-Based Internal Coordinate Analysis for Transition State Characterization"
+  journal: "Journal of Chemical Theory and Computation"
+  year: 2026
+  doi: "10.1021/acs.jctc.5c02073"
