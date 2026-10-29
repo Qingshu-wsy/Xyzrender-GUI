@@ -1,0 +1,135 @@
+# Animations
+
+All GIF output defaults to `{input_basename}.gif`. Override with `-go`.
+
+> **Python.** All `xyzrender` flags below map 1:1 to keyword arguments on `render_gif()` (`--gif-rot y` → `gif_rot="y"`, `--gif-bounce 50,x` → `gif_bounce=(50, "x")`, `-go out.gif` → `output="out.gif"`). The `--anchor "1-5,8"` selector becomes `anchor="1-5,8"` or `anchor=[1, 2, 3, 4, 5, 8]`. See the [Python API guide](../python_api.md).
+>
+> ```python
+> from xyzrender import render_gif
+> render_gif("caffeine.xyz", gif_rot="y", output="caffeine.gif")
+> render_gif("caffeine.xyz", gif_bounce=(50, "x"))
+> render_gif("bimp.out", gif_ts=True, gif_rot="y", vdw="84-169")
+> render_gif("caffeine.xyz", gif_diffuse=True, anchor="1-5,8")
+> ```
+
+## Rotation GIF
+
+| Rotation (y) | Rotation (xy) |
+|-------------|--------------|
+| ![Rotation (y)](../../../examples/images/caffeine.gif) | ![Rotation (xy)](../../../examples/images/caffeine_xy.gif) |
+
+```bash
+xyzrender caffeine.xyz --gif-rot -go caffeine.gif        # y-axis (default)
+xyzrender caffeine.xyz --gif-rot xy -go caffeine_xy.gif  # xy axes
+```
+
+Available rotation axes: `x`, `y`, `z`, `xy`, `xz`, `yz`, `yx`, `zx`, `zy`. Prefix `-` to reverse (e.g. `-xy`). For crystal inputs, a 3-digit Miller index (e.g. `111`) rotates around the corresponding lattice direction.
+
+Control speed and length:
+
+```bash
+xyzrender caffeine.xyz --gif-rot --gif-fps 20 --rot-frames 60 -go fast.gif
+```
+
+## Bounce GIF
+
+```{image} ../../../examples/images/caffeine_bounce_50.gif
+:width: 50%
+:alt: Bounce animation (caffeine, 50 degrees)
+```
+
+```bash
+xyzrender caffeine.xyz --gif-bounce 50 -go caffeine_bounce_50.gif
+```
+
+`--gif-bounce DEG[,AXIS]` starts at the original orientation, then rotates to
+`+DEG`, back through `0`, and to `-DEG` on the rotation axis (`y` by default).
+Append an axis after a comma to override:
+
+```bash
+xyzrender caffeine.xyz --gif-bounce 50,x -go caffeine_bounce_x50.gif
+```
+
+## TS vibration
+
+| TS vibration (mn-h2) | TS + rotation (bimp) |
+|---------------------|---------------------|
+| ![TS vibration (mn-h2)](../../../examples/images/mn-h2.gif) | ![TS + rotation (bimp)](../../../examples/images/bimp.gif) |
+
+```bash
+xyzrender mn-h2.log --gif-ts -go mn-h2.gif
+xyzrender bimp.out --gif-rot --gif-ts --vdw 84-169 -go bimp.gif
+```
+
+## Trajectory
+
+```{image} ../../../examples/images/bimp_trj.gif
+:width: 50%
+:alt: Trajectory animation
+```
+
+```bash
+xyzrender bimp.out --gif-trj --ts -go bimp_trj.gif
+```
+
+```{note}
+`--gif-ts` and `--gif-trj` are mutually exclusive.
+```
+
+For trajectories where connectivity changes (NEB-TS MEPs, reaction paths) add `--trj-bonds` to re-detect bonds per frame:
+
+```{image} ../../../examples/images/sn2_trj_bonds.gif
+:width: 50%
+:alt: SN2 MEP with per-frame bonds
+```
+
+```bash
+xyzrender sn2.v000.xyz --gif-trj --trj-bonds -go sn2_trj_bonds.gif
+```
+
+## Diffuse / assembly
+
+```{image} ../../../examples/images/caffeine_diffuse.gif
+:width: 50%
+:alt: Diffuse assembly animation
+```
+
+```bash
+xyzrender caffeine.xyz --gif-diffuse -go caffeine_diffuse.gif
+```
+
+```python
+render_gif("caffeine.xyz", gif_diffuse=True, output="caffeine_diffuse.gif")
+```
+
+Options:
+
+```bash
+xyzrender caffeine.xyz --gif-diffuse --diffuse-noise 0.5       # more noise
+xyzrender caffeine.xyz --gif-diffuse --diffuse-bonds hide       # no bonds
+xyzrender caffeine.xyz --gif-diffuse --diffuse-bonds show       # keep bonds visible
+xyzrender caffeine.xyz --gif-diffuse --diffuse-forward          # scatter (forward) instead of assembly
+xyzrender caffeine.xyz --gif-diffuse --anchor 1-5               # keep atoms 1–5 fixed
+xyzrender caffeine.xyz --gif-diffuse --gif-rot                  # rotation (360°, y-axis)
+xyzrender caffeine.xyz --gif-diffuse --gif-rot xy               # rotation around xy
+xyzrender caffeine.xyz --gif-diffuse --diffuse-rot              # partial rotation (180°)
+xyzrender caffeine.xyz --gif-diffuse --diffuse-rot 90           # partial rotation (90°)
+```
+
+```{note}
+`--gif-diffuse` cannot be combined with `--gif-ts` or `--gif-trj`.
+`--gif-rot` gives a full 360° rotation; `--diffuse-rot` overrides the angle.
+```
+
+## Combined
+
+Most options can be combined:
+
+| TS animation (rot + ts + vdW + NCI) | Trajectory (trj + NCI + vdW) |
+|------------------------------------|------------------------------|
+| ![TS animation (rot + ts + vdW + NCI)](../../../examples/images/bimp_nci_ts.gif) | ![Trajectory (trj + NCI + vdW)](../../../examples/images/bimp_nci_trj.gif) |
+
+```bash
+xyzrender bimp.out --gif-ts --gif-rot --nci --vdw 84-169 -go bimp_nci_ts.gif
+xyzrender bimp.out --gif-trj --nci --ts --vdw 84-169 -go bimp_nci_trj.gif
+```
